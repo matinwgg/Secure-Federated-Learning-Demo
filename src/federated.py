@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import numpy as np
 
 
-def clip_update(update: np.ndarray, max_norm: float) -> np.ndarray:
-    if max_norm <= 0:
-        raise ValueError("max_norm must be positive")
+ArrayLike = np.ndarray
+
+
+def clip_update(update: ArrayLike, max_norm: float) -> np.ndarray:
+    if not np.isfinite(max_norm) or max_norm <= 0:
+        raise ValueError("max_norm must be a finite positive number")
     update = np.asarray(update, dtype=float)
+    if update.size == 0:
+        raise ValueError("update must not be empty")
     if not np.all(np.isfinite(update)):
         raise ValueError("update contains non-finite values")
     norm = np.linalg.norm(update)
@@ -15,47 +22,56 @@ def clip_update(update: np.ndarray, max_norm: float) -> np.ndarray:
     return update * (max_norm / norm)
 
 
-def gaussian_noise(shape: tuple[int, ...], sigma: float, sensitivity: float, rng: np.random.Generator) -> np.ndarray:
-    if sigma < 0 or sensitivity <= 0:
-        raise ValueError("sigma must be non-negative and sensitivity must be positive")
+def gaussian_noise(
+    shape: tuple[int, ...],
+    sigma: float,
+    sensitivity: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    if not np.isfinite(sigma) or sigma < 0:
+        raise ValueError("sigma must be a finite non-negative number")
+    if not np.isfinite(sensitivity) or sensitivity <= 0:
+        raise ValueError("sensitivity must be a finite positive number")
     return rng.normal(0.0, sigma * sensitivity, size=shape)
 
 
-def fedavg(updates: list[np.ndarray], weights: list[float] | None = None) -> np.ndarray:
+def fedavg(updates: Sequence[np.ndarray], weights: Sequence[float] | None = None) -> np.ndarray:
     if not updates:
         raise ValueError("at least one client update is required")
     arrays = [np.asarray(u, dtype=float) for u in updates]
     shape = arrays[0].shape
     if any(a.shape != shape for a in arrays):
         raise ValueError("all client updates must have the same shape")
-    if any(not np.all(np.isfinite(a)) for a in arrays):
-        raise ValueError("client updates contain non-finite values")
+    if any(a.size == 0 or not np.all(np.isfinite(a)) for a in arrays):
+        raise ValueError("client updates must be non-empty and finite")
     if weights is None:
         weights = [1.0] * len(arrays)
-    if len(weights) != len(arrays) or any(not np.isfinite(w) or w < 0 for w in weights) or sum(weights) <= 0:
-        raise ValueError("invalid aggregation weights")
+    if len(weights) != len(arrays):
+        raise ValueError("weights must match the number of updates")
     w = np.asarray(weights, dtype=float)
+    if not np.all(np.isfinite(w)) or np.any(w < 0) or w.sum() <= 0:
+        raise ValueError("weights must be finite, non-negative and have a positive sum")
     w /= w.sum()
-    return sum(a * wi for a, wi in zip(arrays, w))
+    return np.sum(np.stack(arrays) * w.reshape((-1,) + (1,) * len(shape)), axis=0)
 
 
 def secure_aggregate(
-    updates: list[np.ndarray],
+    updates: Sequence[np.ndarray],
     max_norm: float,
     noise_sigma: float = 0.0,
-    rng: np.random.Generator | None = None,
+    rng: np.random.Generator | int | None = None,
 ) -> np.ndarray:
     """Clip client updates and optionally add Gaussian noise.
 
-    This is a DP-oriented demo primitive, not a complete differentially private
-    federated-learning protocol. Privacy guarantees require accounting for the
-    sampling strategy, client participation, clipping bound, noise multiplier,
-    number of rounds, and privacy budget (epsilon/delta).
+    This is an educational DP-oriented primitive, not a complete DP-FL protocol.
+    Formal guarantees require an explicit privacy accountant, sampling model,
+    participation assumptions, clipping bound, round count and (epsilon, delta).
     """
     clipped = [clip_update(u, max_norm) for u in updates]
     aggregate = fedavg(clipped)
+    if not np.isfinite(noise_sigma) or noise_sigma < 0:
+        raise ValueError("noise_sigma must be a finite non-negative number")
     if noise_sigma == 0:
         return aggregate
-    if rng is None:
-        rng = np.random.default_rng()
-    return aggregate + gaussian_noise(aggregate.shape, noise_sigma, max_norm, rng)
+    generator = np.random.default_rng(rng)
+    return aggregate + gaussian_noise(aggregate.shape, noise_sigma, max_norm, generator)
